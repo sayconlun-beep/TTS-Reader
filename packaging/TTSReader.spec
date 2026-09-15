@@ -1,0 +1,46 @@
+# PyInstaller spec: pyinstaller packaging/TTSReader.spec
+# Expects build/voices (fetch_voices.py) and, on Windows, build/icon.ico
+# (make_icon.py).
+
+import sys
+from pathlib import Path
+
+from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
+
+ROOT = Path(SPECPATH).parent
+ICON = ROOT / "build" / "icon.ico"
+
+datas = [
+    (str(ROOT / "packaging" / "icon.svg"), "packaging"),
+    (str(ROOT / "build" / "voices"), "voices"),
+]
+# piper needs espeak-ng-data next to its espeakbridge extension. The Hebrew
+# and Arabic diacritizer models (~25 MB) only matter for those voices.
+datas += collect_data_files("piper", excludes=[
+    "**/train/**", "**/templates/**", "**/hebrew/**", "**/tashkeel/**"])
+datas += collect_data_files("pymupdf")
+binaries = collect_dynamic_libs("pymupdf") + collect_dynamic_libs("onnxruntime")
+
+a = Analysis(
+    [str(ROOT / "packaging" / "launch.py")],
+    pathex=[str(ROOT)],
+    datas=datas,
+    binaries=binaries,
+    hiddenimports=["piper.espeakbridge", "sounddevice", "pymupdf"],
+    excludes=["tkinter", "piper.train", "piper.http_server", "matplotlib", "PIL",
+              "PySide6.QtNetwork", "PySide6.QtQml", "PySide6.QtQuick"],
+    noarchive=False,
+)
+pyz = PYZ(a.pure)
+
+exe = EXE(
+    pyz,
+    a.scripts,
+    [],
+    exclude_binaries=True,
+    name="TTSReader",
+    console=False,
+    icon=str(ICON) if ICON.exists() and sys.platform == "win32" else None,
+    upx=False,
+)
+coll = COLLECT(exe, a.binaries, a.datas, name="TTSReader", upx=False)
