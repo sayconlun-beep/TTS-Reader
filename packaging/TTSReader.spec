@@ -1,7 +1,8 @@
 # PyInstaller spec: pyinstaller packaging/TTSReader.spec
-# Expects build/voices (fetch_voices.py) and, on Windows, build/icon.ico
-# (make_icon.py).
+# Expects build/voices (fetch_voices.py) and build/icon.ico / icon.icns
+# (make_icon.py). On macOS it also wraps the result in "TTS Reader.app".
 
+import os
 import sys
 from pathlib import Path
 
@@ -9,6 +10,7 @@ from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
 
 ROOT = Path(SPECPATH).parent
 ICON = ROOT / "build" / "icon.ico"
+ICNS = ROOT / "build" / "icon.icns"
 
 datas = [
     (str(ROOT / "packaging" / "icon.svg"), "packaging"),
@@ -44,3 +46,26 @@ exe = EXE(
     upx=False,
 )
 coll = COLLECT(exe, a.binaries, a.datas, name="TTSReader", upx=False)
+
+if sys.platform == "darwin":
+    app = BUNDLE(
+        coll,
+        name="TTS Reader.app",
+        icon=str(ICNS) if ICNS.exists() else None,
+        bundle_identifier="app.ttsreader.TTSReader",
+        version=os.environ.get("APP_VERSION", "0.0.0"),
+        info_plist={
+            "CFBundleDisplayName": "TTS Reader",
+            "LSMinimumSystemVersion": "14.0",
+            "NSHighResolutionCapable": True,
+            # Listed under Finder's "Open With" for books, never the default.
+            "CFBundleDocumentTypes": [
+                {"CFBundleTypeName": "EPUB book", "CFBundleTypeRole": "Viewer",
+                 "LSHandlerRank": "Alternate",
+                 "LSItemContentTypes": ["org.idpf.epub-container"]},
+                {"CFBundleTypeName": "PDF document", "CFBundleTypeRole": "Viewer",
+                 "LSHandlerRank": "Alternate",
+                 "LSItemContentTypes": ["com.adobe.pdf"]},
+            ],
+        },
+    )

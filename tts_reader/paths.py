@@ -1,4 +1,4 @@
-"""Where things live, on Windows and Linux alike."""
+"""Where things live, on Windows, macOS and Linux alike."""
 
 import os
 import sys
@@ -24,6 +24,8 @@ def data_dir():
     if sys.platform == "win32":
         base = os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming"
         return Path(base) / APP_NAME
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / APP_NAME
     base = os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share"
     # Not "tts-reader": that one belongs to the rice's GTK version.
     return Path(base) / "tts-reader-qt"

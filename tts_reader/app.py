@@ -1,4 +1,4 @@
-"""Entry point: `python -m tts_reader [book]` or the packaged TTSReader.exe."""
+"""Entry point: `python -m tts_reader [book]`, TTSReader.exe or TTS Reader.app."""
 
 import os
 import sys
@@ -35,12 +35,34 @@ def main(argv=None):
         except Exception:
             pass
 
+    from PySide6.QtCore import QEvent, QObject
     from PySide6.QtWidgets import QApplication
 
     from . import icons, paths
     from .ui import MainWindow, apply_theme
 
+    class OpenFiles(QObject):
+        """macOS hands over Finder's "Open With" as FileOpen events, not argv,
+        and the first one can arrive before the window exists."""
+
+        def __init__(self):
+            super().__init__()
+            self.window = None
+            self.pending = None
+
+        def eventFilter(self, _obj, event):
+            if event.type() == QEvent.Type.FileOpen and event.file():
+                if self.window:
+                    self.window.show_window()
+                    self.window.load_book(event.file())
+                else:
+                    self.pending = event.file()
+                return True
+            return False
+
     app = QApplication(argv)
+    opener = OpenFiles()
+    app.installEventFilter(opener)
     app.setApplicationName(paths.APP_NAME)
     app.setDesktopFileName("tts-reader-qt")
     app.setQuitOnLastWindowClosed(False)     # closing while playing goes to the tray
@@ -49,7 +71,12 @@ def main(argv=None):
     window = MainWindow(app)
     window.setWindowIcon(app.windowIcon())
     window.show()
+    # Cmd+Q from the macOS app menu quits without closing the window first.
+    app.aboutToQuit.connect(lambda: (window.save_position(), window.player.stop()))
+    opener.window = window
     books = [a for a in argv[1:] if not a.startswith("-") and os.path.isfile(a)]
+    if opener.pending:
+        books.insert(0, opener.pending)
     if books:
         window.load_book(books[0])
     return app.exec()

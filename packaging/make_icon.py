@@ -1,4 +1,5 @@
-"""Render packaging/icon.svg to build/icon.ico for the exe and installer."""
+"""Render packaging/icon.svg to build/icon.ico (Windows) and build/icon.icns
+(macOS)."""
 
 import os
 import sys
@@ -19,7 +20,8 @@ def main():
     OUT.mkdir(exist_ok=True)
     _app = QGuiApplication(sys.argv)
     renderer = QSvgRenderer(str(ROOT / "packaging" / "icon.svg"))
-    img = QImage(256, 256, QImage.Format.Format_ARGB32)
+    # 1024 px so the Retina sizes in the .icns stay sharp.
+    img = QImage(1024, 1024, QImage.Format.Format_ARGB32)
     img.fill(Qt.GlobalColor.transparent)
     painter = QPainter(img)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -27,9 +29,11 @@ def main():
     painter.end()
     png = OUT / "icon.png"
     img.save(str(png))
-    Image.open(png).save(OUT / "icon.ico", sizes=[(s, s) for s in
-                                                  (16, 24, 32, 48, 64, 128, 256)])
-    print(f"wrote {OUT / 'icon.ico'}")
+    with Image.open(png) as icon:
+        icon.save(OUT / "icon.ico", sizes=[(s, s) for s in
+                                          (16, 24, 32, 48, 64, 128, 256)])
+        icon.save(OUT / "icon.icns")
+    print(f"wrote {OUT / 'icon.ico'} and {OUT / 'icon.icns'}")
 
 
 if __name__ == "__main__":

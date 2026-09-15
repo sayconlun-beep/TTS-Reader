@@ -1,0 +1,90 @@
+name: macOS build
+
+# Tags and manual runs only: macOS minutes count 10x against a private
+# repo's free allowance, so pushes to main build on Windows alone.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    # Apple Silicon. onnxruntime ships no Intel macOS wheels any more.
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r requirements-build.txt
+
+      - name: Cache voices
+        uses: actions/cache@v6
+        with:
+          path: build/voices
+          key: voices-${{ hashFiles('packaging/fetch_voices.py') }}
+
+      - name: Download voices
+        run: python packaging/fetch_voices.py
+
+      - name: Unit tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+          TTS_READER_AUDIO: "null"
+        run: python -m unittest discover -s tests -v
+
+      - name: Version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "APP_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+          else
+            echo "APP_VERSION=0.0.${GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"
+          fi
+
+      - name: App icon
+        run: python packaging/make_icon.py
+
+      - name: PyInstaller
+        run: pyinstaller packaging/TTSReader.spec --noconfirm --clean --distpath dist --workpath build/pyinstaller
+
+      # Ad-hoc signature over the finished bundle. Without a valid one, Apple
+      # Silicon refuses to run it and Gatekeeper calls it "damaged".
+      - name: Sign
+        run: |
+          codesign --force --deep --sign - "dist/TTS Reader.app"
+          codesign --verify --deep --strict --verbose=2 "dist/TTS Reader.app"
+
+      - name: Self-test the packaged app
+        run: |
+          "dist/TTS Reader.app/Contents/MacOS/TTSReader" --self-test "$PWD/selftest.log"; status=$?
+          cat selftest.log || true
+          exit $status
+
+      - name: Disk image
+        run: |
+          mkdir -p build/dmg
+          ditto "dist/TTS Reader.app" "build/dmg/TTS Reader.app"
+          ln -s /Applications build/dmg/Applications
+          hdiutil create -volname "TTS Reader" -srcfolder build/dmg -ov -format UDZO \
+            "dist/TTSReader-$APP_VERSION-macOS-AppleSilicon.dmg"
+          ls -lh dist/*.dmg
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --title "TTS Reader $APP_VERSION" \
+            --notes-file packaging/release-notes.md || echo "release exists already"
+          gh release upload "$GITHUB_REF_NAME" dist/*.dmg --clobber
