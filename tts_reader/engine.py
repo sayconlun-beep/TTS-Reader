@@ -1,9 +1,10 @@
-"""Playback: piper renders a window of sentences around the playhead and one
-PortAudio stream plays them back to back.
+"""Playback: piper or Kokoro renders a window of sentences around the playhead
+and one PortAudio stream plays them back to back.
 
-Same shape as the GTK version, minus mpv: piper runs in-process, speed is
-piper's own length_scale (natural pitch, no time-stretching), and the audio
-callback pulls sentences straight off a queue.
+Same shape as the GTK version, minus mpv: the voice runs in-process, speed is
+the model's own (piper's length_scale, Kokoro's speed input - natural pitch,
+no time-stretching), and the audio callback pulls sentences straight off a
+queue.
 
 Every jump bumps `gen`. Audio rendered for an older generation is dropped
 before it reaches the queue, so a sentence that was mid-render when you
@@ -19,16 +20,53 @@ import time
 import numpy as np
 from PySide6.QtCore import QObject, QTimer, Signal
 
-from . import paths
+from . import kokoro, paths
 
 AHEAD = 12          # sentences rendered ahead of the playhead
+MODELS_KEPT = 3     # voices kept loaded, since paragraph voices alternate
 KEEP_BEHIND = 20    # sentences kept behind it, so stepping back is instant
 GAP = 0.2           # seconds of silence after each sentence, like piper's CLI
 
 
-def voice_rate(model_path):
+def voice_rate(voice, model_path):
+    if paths.is_kokoro(voice):
+        return kokoro.KOKORO_RATE
     with open(f"{model_path}.json", encoding="utf-8") as fh:
         return int(json.load(fh)["audio"]["sample_rate"])
+
+
+class PiperBackend:
+    def __init__(self, model_path):
+        from piper import PiperVoice
+        self.voice = PiperVoice.load(model_path)
+        self.sample_rate = self.voice.config.sample_rate
+
+    def render(self, text, speed):
+        from piper import SynthesisConfig
+        config = SynthesisConfig(length_scale=self.voice.config.length_scale / speed)
+        return [c.audio_int16_array
+                for c in self.voice.synthesize(text, syn_config=config)]
+
+
+def resample(samples, src, dst):
+    """int16 at src Hz -> int16 at dst Hz. Linear, which is plenty for speech
+    moving between piper's 22.05 kHz and Kokoro's 24 kHz."""
+    if src == dst or not len(samples):
+        return samples
+    n = max(1, round(len(samples) * dst / src))
+    x = np.linspace(0, len(samples) - 1, n)
+    return np.interp(x, np.arange(len(samples)), samples).astype(np.int16)
+
+
+class KokoroBackend:
+    sample_rate = kokoro.KOKORO_RATE
+
+    def __init__(self, model, name):
+        self.model, self.name = model, name
+
+    def render(self, text, speed):
+        audio = self.model.synthesize(text, self.name, speed)
+        return [(np.clip(audio, -1, 1) * 32767).astype(np.int16)]
 
 
 class SoundOutput:
@@ -104,8 +142,9 @@ class Player(QObject):
         self.output = None
         self.rate = None
         self.thread = None
-        self.model = self.model_voice = None
+        self.models = collections.OrderedDict()     # voice -> backend, recent last
         self.model_lock = threading.Lock()
+        self.kokoro = None              # (model path, Kokoro), kept across voices
         # Other threads never touch Qt: they post events, drained here.
         self.poll = QTimer(self)
         self.poll.setInterval(40)
@@ -139,7 +178,7 @@ class Player(QObject):
             self.book, self.voice, self.speed = book, voice, speed
             self.pos = self.next_render = idx
             try:
-                self.rate = voice_rate(model)
+                self.rate = voice_rate(voice, model)
                 self.output = make_output(self.rate, self._fill)
             except Exception as e:
                 self.output = None
@@ -219,7 +258,7 @@ class Player(QObject):
         if not self.running:
             return
         try:
-            rate = voice_rate(paths.list_voices()[voice])
+            rate = voice_rate(voice, paths.list_voices()[voice])
         except (OSError, ValueError, KeyError):
             rate = self.rate            # the render thread reports the failure
         if rate != self.rate:
@@ -289,16 +328,46 @@ class Player(QObject):
         with self.cond:
             self.events.append((kind, value))
 
+    def voice_for(self, book, idx):
+        """The paragraph's own voice if the book gives it one, else the book voice."""
+        if book.voices:
+            return book.voices.get(book.paragraph_at(idx), self.voice)
+        return self.voice
+
+    def voices_changed(self, paragraphs):
+        """book.voices changed for these paragraphs: re-render what's queued."""
+        if not self.running:
+            return
+        spans = [self.book.paragraphs[n][1:] for n in paragraphs]
+        with self.cond:
+            for i in [i for i in self.cache if any(lo <= i < hi for lo, hi in spans)]:
+                del self.cache[i]
+            queued = any(lo < self.next_render and hi > self.pos for lo, hi in spans)
+        if queued:
+            self.jump(self.pos, play=not self.is_paused)
+
     def _model_for(self, voice):
         with self.model_lock:
-            if self.model_voice != voice:
-                from piper import PiperVoice
+            model = self.models.pop(voice, None)
+            if model is None:
                 path = paths.list_voices().get(voice)
                 if not path:
                     raise FileNotFoundError(f"no voice named {voice}")
-                self.model = PiperVoice.load(path)
-                self.model_voice = voice
-            return self.model
+                if paths.is_kokoro(voice):
+                    if self.kokoro is None or self.kokoro[0] != path:
+                        from piper.phonemize_espeak import ESPEAK_DATA_DIR
+                        voices = os.path.join(os.path.dirname(path),
+                                              kokoro.KOKORO_VOICES)
+                        self.kokoro = (path, kokoro.Kokoro(path, voices,
+                                                           ESPEAK_DATA_DIR))
+                    model = KokoroBackend(
+                        self.kokoro[1], voice[len(paths.KOKORO_PREFIX):])
+                else:
+                    model = PiperBackend(path)
+                while len(self.models) >= MODELS_KEPT:
+                    self.models.popitem(last=False)
+            self.models[voice] = model
+            return model
 
     def _render_loop(self, book, session):
         total = len(book.sentences)
@@ -310,7 +379,7 @@ class Player(QObject):
                 if self.session != session:
                     return
                 gen, idx = self.gen, self.next_render
-                key = (self.voice, self.speed)
+                key = (self.voice_for(book, idx), self.speed, self.rate)
                 self.next_render += 1
                 hit = self.cache.get(idx)
                 samples = hit[1] if hit and hit[0] == key else None
@@ -319,14 +388,14 @@ class Player(QObject):
                 if samples is None:
                     continue
                 with self.cond:
-                    if key == (self.voice, self.speed):
+                    if key == (self.voice_for(book, idx), self.speed, self.rate):
                         self.cache[idx] = (key, samples)
             with self.cond:
                 if gen == self.gen and self.session == session:
                     self.queue.append([idx, samples, 0])
 
     def _synth(self, key, text, session):
-        voice, speed = key
+        voice, speed, rate = key
         try:
             model = self._model_for(voice)
         except Exception as e:
@@ -335,19 +404,18 @@ class Player(QObject):
                 while self.session == session:
                     self.cond.wait()
             return None
-        from piper import SynthesisConfig
-        config = SynthesisConfig(length_scale=model.config.length_scale / speed)
         err = None
         for _attempt in range(2):
             try:
                 with self.model_lock:
-                    parts = [c.audio_int16_array
-                             for c in model.synthesize(text, syn_config=config)]
+                    parts = model.render(text, speed)
                 break
             except Exception as e:
                 err = e
         else:
-            self._post("error", f"piper failed to render a sentence ({err}).")
+            self._post("error", f"The voice failed to render a sentence ({err}).")
             return None
-        gap = np.zeros(int(model.config.sample_rate * GAP / speed), np.int16)
-        return np.concatenate(parts + [gap])
+        gap = np.zeros(int(model.sample_rate * GAP / speed), np.int16)
+        # The stream runs at the book voice's rate; another paragraph voice
+        # may have its own.
+        return resample(np.concatenate(parts + [gap]), model.sample_rate, rate)

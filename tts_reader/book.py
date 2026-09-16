@@ -1,9 +1,11 @@
-"""Books as sentences: the splitter plus the EPUB and PDF parsers.
+"""Books as sentences: the splitter plus the EPUB, PDF, DOCX and Markdown parsers.
 
 Ported from the rice's GTK tts-reader. The EPUB side is unchanged; PDFs go
 through PyMuPDF instead of Poppler, which has no Windows wheels.
 """
 
+import bisect
+import html
 import os
 import posixpath
 import re
@@ -11,6 +13,9 @@ import zipfile
 from urllib.parse import unquote
 
 from lxml import etree
+
+
+BOOK_SUFFIXES = (".epub", ".pdf", ".docx", ".md", ".markdown")
 
 
 class BookError(Exception):
@@ -60,6 +65,7 @@ class Book:
 
     paragraphs: [(is_heading, first_sentence, end_sentence)]
     chapters:   [(title, depth, first_sentence)]
+    voices:     {paragraph index: voice} - paragraphs read by another voice
     """
 
     def __init__(self, path, title):
@@ -69,6 +75,7 @@ class Book:
         self.headings = set()        # sentence indices that are headings
         self.paragraphs = []
         self.chapters = []
+        self.voices = {}
 
     def add_para(self, text, heading=False):
         text = " ".join(text.split())
@@ -91,6 +98,14 @@ class Book:
             s += "."
         return s
 
+    def paragraph_at(self, i):
+        """Index into self.paragraphs of the paragraph holding sentence i."""
+        return bisect.bisect_right([p[1] for p in self.paragraphs], i) - 1
+
+    def paragraph_text(self, n):
+        _h, lo, hi = self.paragraphs[n]
+        return " ".join(self.sentences[lo:hi])
+
     def chapter_at(self, i):
         """Index into self.chapters of the chapter containing sentence i."""
         best = -1
@@ -111,8 +126,12 @@ def open_book(path):
         book = parse_epub(path)
     elif ext == ".pdf":
         book = parse_pdf(path)
+    elif ext == ".docx":
+        book = parse_docx(path)
+    elif ext in (".md", ".markdown"):
+        book = parse_markdown(path)
     else:
-        raise BookError("Only EPUB and PDF files can be opened.")
+        raise BookError("Only EPUB, PDF, DOCX and Markdown files can be opened.")
     if not book.sentences:
         raise BookError("No readable text was found in this file.")
     # Chapters must be in reading order for chapter_at() and the sidebar.
@@ -323,6 +342,240 @@ def _walk_xhtml(root, book, doc, anchors, first_heading):
     for body in bodies or [root]:
         walk(body)
     flush()
+
+
+# -- Markdown ---------------------------------------------------------------
+MD_ATX = re.compile(r"^ {0,3}(#{1,6})(?:[ \t]+(.*?))?(?:[ \t]+#+)?[ \t]*$")
+MD_SETEXT = re.compile(r"^ {0,3}(=+|-+)[ \t]*$")
+MD_FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+MD_RULE = re.compile(r"^ {0,3}([-*_])([ \t]*\1){2,}[ \t]*$")
+MD_ITEM = re.compile(r"^[ \t]*(?:[-*+]|\d{1,9}[.)])[ \t]+(?:\[[ xX]\][ \t]+)?")
+MD_QUOTE = re.compile(r"^[ \t]*(?:>[ \t]?)+")
+MD_LINKDEF = re.compile(r"^ {0,3}\[[^\]]+\]:[ \t]*\S")
+MD_TABLE_SEP = re.compile(r"^[ \t]*\|?[ \t]*:?-+:?[ \t]*(\|[ \t]*:?-+:?[ \t]*)*\|?[ \t]*$")
+MD_INLINE = [
+    (re.compile(r"!\[([^\]]*)\]\([^)]*\)"), ""),             # images
+    (re.compile(r"\[([^\]]+)\]\([^)]*\)"), r"\1"),           # [text](url)
+    (re.compile(r"\[([^\]]+)\]\[[^\]]*\]"), r"\1"),          # [text][ref]
+    (re.compile(r"<(?:https?|mailto):[^>]*>"), ""),          # autolinks
+    (re.compile(r"</?[A-Za-z][^>]*>"), ""),                  # inline HTML
+    (re.compile(r"`+([^`]*)`+"), r"\1"),
+    (re.compile(r"(\*\*|__)(?=\S)(.+?)(?<=\S)\1"), r"\2"),
+    (re.compile(r"\*(?=\S)(.+?)(?<=\S)\*"), r"\1"),
+    (re.compile(r"(?<!\w)_(?=\S)(.+?)(?<=\S)_(?!\w)"), r"\1"),
+    (re.compile(r"~~(.+?)~~"), r"\1"),
+    (re.compile(r"\\([\\`*_{}\[\]()#+\-.!|>~])"), r"\1"),
+]
+
+
+def _md_inline(text):
+    for pattern, repl in MD_INLINE:
+        text = pattern.sub(repl, text)
+    return html.unescape(text)
+
+
+def parse_markdown(path):
+    try:
+        with open(path, encoding="utf-8-sig", errors="replace") as fh:
+            text = fh.read()
+    except OSError:
+        raise BookError("Couldn't read this Markdown file.")
+    text = re.sub(r"<!--.*?-->", "", text, flags=re.S)
+    lines = text.splitlines()
+
+    title = None
+    if lines and lines[0].strip() == "---":
+        # YAML front matter: keep its title, don't read the rest aloud.
+        for n, ln in enumerate(lines[1:], 1):
+            if ln.strip() in ("---", "..."):
+                for meta in lines[1:n]:
+                    m = re.match(r"^title:\s*(.+?)\s*$", meta)
+                    if m:
+                        title = m.group(1).strip("\"'")
+                lines = lines[n + 1:]
+                break
+
+    book = Book(path, title or os.path.splitext(os.path.basename(path))[0])
+    headings = []       # (level, title, sentence)
+    buf = []
+    fence = None
+
+    def flush():
+        book.add_para(_md_inline(" ".join(buf)))
+        buf.clear()
+
+    def heading(level, raw):
+        flush()
+        label = " ".join(_md_inline(raw).split())
+        if label:
+            headings.append((level, label, len(book.sentences)))
+            book.add_para(label, heading=True)
+
+    for ln in lines:
+        if fence:
+            if ln.strip().startswith(fence):
+                fence = None
+            continue
+        m = MD_FENCE.match(ln)
+        if m:
+            flush()                     # code blocks aren't read aloud
+            fence = m.group(1)[0] * 3
+            continue
+        if not ln.strip() or MD_LINKDEF.match(ln):
+            flush()
+            continue
+        m = MD_ATX.match(ln)
+        if m:
+            heading(len(m.group(1)), m.group(2) or "")
+            continue
+        m = MD_SETEXT.match(ln)
+        if m and buf and not (len(buf) == 1 and MD_ITEM.match(buf[0])):
+            raw = " ".join(buf)
+            buf.clear()
+            heading(1 if m.group(1)[0] == "=" else 2, raw)
+            continue
+        if MD_RULE.match(ln):
+            flush()
+            continue
+        ln = MD_QUOTE.sub("", ln)
+        if "|" in ln and ln.strip().startswith("|") or MD_TABLE_SEP.match(ln):
+            flush()
+            if not MD_TABLE_SEP.match(ln):
+                cells = [c.strip() for c in ln.strip().strip("|").split("|")]
+                book.add_para(_md_inline(", ".join(c for c in cells if c)))
+            continue
+        if MD_ITEM.match(ln):
+            flush()
+            ln = MD_ITEM.sub("", ln)
+        buf.append(ln.strip())
+    flush()
+
+    if headings:
+        top = min(level for level, _t, _s in headings)
+        book.chapters = [(t, level - top, s) for level, t, s in headings]
+        h1 = [t for level, t, _s in headings if level == 1]
+        if not title and h1:
+            book.title = h1[0]
+    return book
+
+
+# -- DOCX -------------------------------------------------------------------
+W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+
+
+def parse_docx(path):
+    try:
+        z = zipfile.ZipFile(path)
+        document = _xml(z.read("word/document.xml"))
+    except zipfile.BadZipFile:
+        # Some exporters write Markdown or plain text under a .docx name.
+        try:
+            with open(path, "rb") as fh:
+                head = fh.read(4096)
+            head.decode("utf-8")
+        except (OSError, UnicodeDecodeError):
+            head = b"\0"
+        if head.strip() and b"\0" not in head:
+            return parse_markdown(path)
+        raise BookError("This DOCX is damaged or not really a Word document.")
+    except (OSError, KeyError, BookError):
+        raise BookError("This DOCX is damaged or not really a Word document.")
+    names = set(z.namelist())
+
+    # styleId -> (name, outline level, basedOn), for spotting headings.
+    styles = {}
+    if "word/styles.xml" in names:
+        for st in _xml(z.read("word/styles.xml")).iter(W + "style"):
+            name = st.find(W + "name")
+            lvl = st.find(f"{W}pPr/{W}outlineLvl")
+            based = st.find(W + "basedOn")
+            styles[st.get(W + "styleId")] = (
+                (name.get(W + "val") if name is not None else "").lower(),
+                lvl.get(W + "val") if lvl is not None else None,
+                based.get(W + "val") if based is not None else None)
+
+    def style_level(style_id):
+        """0-based heading level, "title", or None for body text."""
+        seen = set()
+        while style_id in styles and style_id not in seen:
+            seen.add(style_id)
+            name, lvl, based = styles[style_id]
+            if name == "title":
+                return "title"
+            m = re.match(r"heading ?(\d)$", name)
+            if m:
+                return int(m.group(1)) - 1
+            if lvl is not None and lvl.isdigit() and int(lvl) < 9:
+                return int(lvl)
+            style_id = based
+        return None
+
+    title = None
+    if "docProps/core.xml" in names:
+        for el in _xml(z.read("docProps/core.xml")).iter():
+            if _local(el.tag) == "title" and el.text and el.text.strip():
+                title = el.text.strip()
+    book = Book(path, title or os.path.splitext(os.path.basename(path))[0])
+    headings = []
+    titled = []
+
+    def para_text(p):
+        out = []
+
+        def walk(el):
+            name = _local(el.tag)
+            if el is not p and name in ("p", "txbxcontent", "fallback",
+                                        "footnotereference", "instrtext"):
+                return
+            if name == "t" and el.text:
+                out.append(el.text)
+            elif name in ("tab", "br", "cr"):
+                out.append(" ")
+            for child in el:
+                walk(child)
+
+        walk(p)
+        return "".join(out)
+
+    def walk(el):
+        for child in el:
+            name = _local(child.tag)
+            if name == "p":
+                pstyle = child.find(f"{W}pPr/{W}pStyle")
+                level = style_level(pstyle.get(W + "val")) \
+                    if pstyle is not None else None
+                own = child.find(f"{W}pPr/{W}outlineLvl")
+                if level is None and own is not None and \
+                        (own.get(W + "val") or "").isdigit() and \
+                        int(own.get(W + "val")) < 9:
+                    level = int(own.get(W + "val"))
+                text = " ".join(para_text(child).split())
+                if not text:
+                    continue
+                if level == "title":
+                    if not title and not titled:
+                        book.title = text
+                        titled.append(text)
+                    book.add_para(text, heading=True)
+                elif level is not None:
+                    headings.append((level, text, len(book.sentences)))
+                    book.add_para(text, heading=True)
+                else:
+                    book.add_para(text)
+            elif name == "tr":
+                cells = [" ".join(para_text(p).split())
+                         for tc in child.findall(W + "tc")
+                         for p in tc.iter(W + "p")]
+                book.add_para(", ".join(c for c in cells if c))
+            elif name not in ("sectpr", "fallback"):
+                walk(child)
+
+    body = document.find(W + "body")
+    walk(body if body is not None else document)
+    if headings:
+        top = min(level for level, _t, _s in headings)
+        book.chapters = [(t, level - top, s) for level, t, s in headings]
+    return book
 
 
 # -- PDF --------------------------------------------------------------------

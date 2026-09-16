@@ -27,6 +27,46 @@ PDF_SENTENCES = [
 ]
 PDF_CHAPTERS = [("Introduction", 0, 0), ("Chapter 1", 0, 2), ("Section 1.1", 1, 4)]
 
+MARKDOWN = """---
+title: Sample Notes
+tags: [x]
+---
+# Getting Started
+
+Read **this** first. It links to [the docs](https://example.com)
+and wraps onto a second line.
+
+<!-- a comment that isn't read -->
+- First item
+- Second `item`
+
+```sh
+echo "code is skipped"
+```
+
+Details
+-------
+
+> A quoted line.
+
+| Name | Value |
+| ---- | ----- |
+| Speed | Fast |
+"""
+MARKDOWN_SENTENCES = [
+    "Getting Started", "Read this first.",
+    "It links to the docs and wraps onto a second line.", "First item",
+    "Second item", "Details", "A quoted line.", "Name, Value", "Speed, Fast",
+]
+MARKDOWN_CHAPTERS = [("Getting Started", 0, 0), ("Details", 1, 5)]
+
+DOCX_SENTENCES = [
+    "Sample Report", "Overview", "The first paragraph.", "It has two sentences.",
+    "Tabs and breaks join words.", "Background", "Cell one, Cell two",
+    "Findings", "The last word.",
+]
+DOCX_CHAPTERS = [("Overview", 0, 1), ("Background", 1, 5), ("Findings", 0, 7)]
+
 
 def _xhtml(body):
     return ('<?xml version="1.0" encoding="utf-8"?>\n'
@@ -69,6 +109,48 @@ def make_epub(path):
         z.writestr("mimetype", "application/epub+zip", zipfile.ZIP_STORED)
         for name, data in files.items():
             z.writestr(name, data, zipfile.ZIP_DEFLATED)
+    return path
+
+
+def make_markdown(path):
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(MARKDOWN)
+    return path
+
+
+def make_docx(path):
+    w = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+
+    def para(text, style=None):
+        ppr = f'<w:pPr><w:pStyle w:val="{style}"/></w:pPr>' if style else ""
+        return f"<w:p>{ppr}<w:r><w:t xml:space=\"preserve\">{text}</w:t></w:r></w:p>"
+
+    body = "".join([
+        para("Sample Report", "Title"),
+        para("Overview", "Heading1"),
+        '<w:p><w:r><w:t>The first paragraph. </w:t></w:r>'
+        '<w:r><w:t>It has two sentences.</w:t></w:r></w:p>',
+        '<w:p><w:r><w:t>Tabs</w:t><w:tab/><w:t>and</w:t><w:br/>'
+        '<w:t>breaks join words.</w:t></w:r></w:p>',
+        para("", None),
+        para("Background", "MySubHeading"),
+        "<w:tbl><w:tr><w:tc>" + para("Cell one") + "</w:tc><w:tc>"
+        + para("Cell two") + "</w:tc></w:tr></w:tbl>",
+        '<w:p><w:pPr><w:outlineLvl w:val="0"/></w:pPr>'
+        '<w:r><w:t>Findings</w:t></w:r></w:p>',
+        para("The last word."),
+    ])
+    styles = (
+        f'<w:style w:type="paragraph" w:styleId="Title"><w:name w:val="Title"/></w:style>'
+        f'<w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/></w:style>'
+        f'<w:style w:type="paragraph" w:styleId="Heading2"><w:name w:val="heading 2"/></w:style>'
+        f'<w:style w:type="paragraph" w:styleId="MySubHeading"><w:name w:val="My Sub"/>'
+        f'<w:basedOn w:val="Heading2"/></w:style>')
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("[Content_Types].xml", "<Types/>")
+        z.writestr("word/document.xml",
+                   f'<w:document {w}><w:body>{body}<w:sectPr/></w:body></w:document>')
+        z.writestr("word/styles.xml", f"<w:styles {w}>{styles}</w:styles>")
     return path
 
 
@@ -155,6 +237,16 @@ def _run(log, tmp, shot):
     _check("pdf sentences", pdf.sentences, PDF_SENTENCES)
     _check("pdf chapters", pdf.chapters, PDF_CHAPTERS)
     log("pdf: ok")
+    md = open_book(make_markdown(os.path.join(tmp, "sample.md")))
+    _check("markdown title", md.title, "Sample Notes")
+    _check("markdown sentences", md.sentences, MARKDOWN_SENTENCES)
+    _check("markdown chapters", md.chapters, MARKDOWN_CHAPTERS)
+    log("markdown: ok")
+    docx = open_book(make_docx(os.path.join(tmp, "sample.docx")))
+    _check("docx title", docx.title, "Sample Report")
+    _check("docx sentences", docx.sentences, DOCX_SENTENCES)
+    _check("docx chapters", docx.chapters, DOCX_CHAPTERS)
+    log("docx: ok")
 
     voices = paths.list_voices()
     log(f"voices: {', '.join(voices) or 'none'}")
@@ -162,17 +254,32 @@ def _run(log, tmp, shot):
         raise AssertionError("no voices found")
     from piper import PiperVoice
     start = time.monotonic()
-    name = paths.DEFAULT_VOICE if paths.DEFAULT_VOICE in voices else next(iter(voices))
+    name = paths.default_voice([v for v in voices if not paths.is_kokoro(v)])
     voice = PiperVoice.load(voices[name])
     samples = sum(len(c.audio_int16_array) for c in voice.synthesize("Self test."))
     if samples < 1000:
         raise AssertionError(f"piper produced only {samples} samples")
     log(f"piper: {samples} samples in {time.monotonic() - start:.2f}s")
+    kokoro_voices = [v for v in voices if paths.is_kokoro(v)]
+    if kokoro_voices:
+        from piper.phonemize_espeak import ESPEAK_DATA_DIR
+
+        from .kokoro import KOKORO_VOICES, Kokoro
+        start = time.monotonic()
+        model = voices[kokoro_voices[0]]
+        kokoro = Kokoro(model, os.path.join(os.path.dirname(model), KOKORO_VOICES),
+                        ESPEAK_DATA_DIR)
+        samples = len(kokoro.synthesize("Self test.", kokoro_voices[0][7:]))
+        if samples < 1000:
+            raise AssertionError(f"kokoro produced only {samples} samples")
+        log(f"kokoro: {samples} samples in {time.monotonic() - start:.2f}s")
+    elif paths.FROZEN:
+        raise AssertionError("the Kokoro model isn't bundled")
 
     from PySide6.QtWidgets import QApplication
 
     from . import icons
-    from .ui import MainWindow, apply_theme
+    from .ui import MainWindow, apply_theme, voice_label
 
     # Qt only prints exceptions raised in slots; make them fail the test.
     slot_errors = []
@@ -201,6 +308,25 @@ def _run(log, tmp, shot):
     no_slot_errors("book loading")
     _check("chapter list", window.chapter_tree.topLevelItemCount(), 2)
     _check("title", window.title_label.text(), "Sample Book")
+    voice, combo = window._voice(), window.voice_combo
+    if voice not in window._favourites():
+        window.toggle_favourite()
+        _check("favourite listed first", combo.itemData(0), voice)
+        _check("favourite starred", combo.itemText(0).startswith("★"), True)
+        _check("favourite still selected", window._voice(), voice)
+        window.toggle_favourite()
+        _check("unfavourited", voice in window._favourites(), False)
+        _check("unfavourited voice still selected", window._voice(), voice)
+        log("favourites: ok")
+    other = next(v for v in window.voices if v != voice)
+    window.set_paragraph_voice([1, 2], other)
+    _check("paragraph voices", window.book.voices, {1: other, 2: other})
+    _check("paragraph tooltip", window.view.voice_names.get(2), voice_label(other))
+    _check("paragraph voices saved",
+           sorted(window.lib.book(window.book.path).get("voices", {})), ["1", "2"])
+    window.set_paragraph_voice([1, 2], "")
+    _check("paragraph voices cleared", window.book.voices, {})
+    log("paragraph voices: ok")
     window.toggle_play()
     _wait(app, lambda: window.pos >= 2 or errors, 60, "playback to reach sentence 2")
     if errors:

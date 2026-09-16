@@ -37,13 +37,19 @@ Name: "{autoprograms}\TTS Reader"; Filename: "{app}\TTSReader.exe"
 Name: "{autodesktop}\TTS Reader"; Filename: "{app}\TTSReader.exe"; Tasks: desktopicon
 
 [Registry]
-; "Open with" entries for EPUB and PDF, without taking over the default app.
+; "Open with" entries for EPUB, PDF, DOCX and Markdown, without taking over the default app.
 Root: HKA; Subkey: "Software\Classes\Applications\TTSReader.exe"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "TTS Reader"; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Classes\Applications\TTSReader.exe\shell\open\command"; ValueType: string; ValueData: """{app}\TTSReader.exe"" ""%1"""
 Root: HKA; Subkey: "Software\Classes\Applications\TTSReader.exe\SupportedTypes"; ValueType: string; ValueName: ".epub"; ValueData: ""
 Root: HKA; Subkey: "Software\Classes\Applications\TTSReader.exe\SupportedTypes"; ValueType: string; ValueName: ".pdf"; ValueData: ""
+Root: HKA; Subkey: "Software\Classes\Applications\TTSReader.exe\SupportedTypes"; ValueType: string; ValueName: ".docx"; ValueData: ""
+Root: HKA; Subkey: "Software\Classes\Applications\TTSReader.exe\SupportedTypes"; ValueType: string; ValueName: ".md"; ValueData: ""
+Root: HKA; Subkey: "Software\Classes\Applications\TTSReader.exe\SupportedTypes"; ValueType: string; ValueName: ".markdown"; ValueData: ""
 Root: HKA; Subkey: "Software\Classes\.epub\OpenWithList\TTSReader.exe"; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Classes\.pdf\OpenWithList\TTSReader.exe"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\.docx\OpenWithList\TTSReader.exe"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\.md\OpenWithList\TTSReader.exe"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\.markdown\OpenWithList\TTSReader.exe"; Flags: uninsdeletekey
 
 [Run]
 Filename: "{app}\TTSReader.exe"; Description: "{cm:LaunchProgram,TTS Reader}"; Flags: nowait postinstall skipifsilent

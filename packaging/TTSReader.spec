@@ -66,6 +66,12 @@ if sys.platform == "darwin":
                 {"CFBundleTypeName": "PDF document", "CFBundleTypeRole": "Viewer",
                  "LSHandlerRank": "Alternate",
                  "LSItemContentTypes": ["com.adobe.pdf"]},
+                {"CFBundleTypeName": "Word document", "CFBundleTypeRole": "Viewer",
+                 "LSHandlerRank": "Alternate",
+                 "LSItemContentTypes": ["org.openxmlformats.wordprocessingml.document"]},
+                {"CFBundleTypeName": "Markdown document", "CFBundleTypeRole": "Viewer",
+                 "LSHandlerRank": "Alternate",
+                 "LSItemContentTypes": ["net.daringfireball.markdown"]},
             ],
         },
     )

@@ -6,8 +6,9 @@ import os
 import time
 from pathlib import Path
 
-from PySide6.QtCore import (QByteArray, QEasingCurve, QEvent, QPropertyAnimation,
-                            QSize, Qt, QThreadPool, QTimer, QUrl, Signal)
+from PySide6.QtCore import (QByteArray, QEasingCurve, QEvent, QPoint,
+                            QPropertyAnimation, QSize, Qt, QThreadPool, QTimer,
+                            QUrl, Signal)
 from PySide6.QtGui import (QAction, QActionGroup, QColor, QDesktopServices, QFont,
                            QKeySequence, QPainter, QPalette, QTextBlockFormat,
                            QTextCharFormat, QTextCursor, QTextDocument)
@@ -16,11 +17,11 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox,
                                QLabel, QMainWindow, QMenu, QProgressBar,
                                QProxyStyle, QPushButton, QSizePolicy, QSlider,
                                QSplitter, QStackedWidget, QStyle,
-                               QSystemTrayIcon, QTextEdit, QToolButton,
+                               QSystemTrayIcon, QTextEdit, QToolButton, QToolTip,
                                QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
 
 from . import icons, paths
-from .book import BookError, open_book
+from .book import BOOK_SUFFIXES, BookError, open_book
 from .engine import Player
 from .library import Library
 
@@ -136,10 +137,29 @@ def apply_theme(app):
 
 
 def voice_label(name):
+    if name.startswith("kokoro:"):
+        # kokoro:bm_george - accent letter, gender letter, speaker.
+        accent, _, speaker = name[7:].partition("_")
+        region = {"a": "en_US", "b": "en_GB"}.get(accent[:1], accent)
+        return f"{speaker.replace('_', ' ').title()} ({region}, Kokoro)"
     parts = name.split("-")
     if len(parts) >= 2:
         return f"{parts[1].replace('_', ' ').title()} ({parts[0]})"
     return name
+
+
+# Paragraph tints: one colour per voice used in the book, in name order.
+TINTS = ["#7dcfff", "#bb9af7", "#ff9e64", "#9ece6a", "#f7768e", "#e0af68"]
+
+
+def voice_tints(voices):
+    """{voice: soft colour} for every voice in a book's paragraph voices."""
+    tints = {}
+    for n, voice in enumerate(sorted(set(voices.values()))):
+        color = QColor(TINTS[n % len(TINTS)])
+        color.setAlphaF(0.16)
+        tints[voice] = color
+    return tints
 
 
 def time_left_label(minutes):
@@ -206,9 +226,11 @@ class Toast(QLabel):
 
 
 class SentenceView(QTextEdit):
-    """The book's text; click a sentence to read from it."""
+    """The book's text; click a sentence to read from it, right-click a
+    paragraph (or a selection) to give it its own voice."""
 
     sentenceClicked = Signal(int)
+    paragraphMenuRequested = Signal(list, QPoint)      # paragraph indices, global pos
     userScrolled = Signal()
     zoomRequested = Signal(int)
     MAX_WIDTH = 720
@@ -223,6 +245,7 @@ class SentenceView(QTextEdit):
         self.setAcceptDrops(False)
         self.viewport().setCursor(Qt.CursorShape.ArrowCursor)
         self.starts, self.ends, self.heads = [], [], []
+        self.voice_names = {}          # paragraph index -> voice label, for tooltips
         self.own_doc = None
         self.current = None
         self.press_pos = None
@@ -367,6 +390,56 @@ class SentenceView(QTextEdit):
             self.userScrolled.emit()
         super().keyPressEvent(event)
 
+    def contextMenuEvent(self, event):
+        if not self.starts:
+            return
+        # Each paragraph is one text block. A selection under the pointer
+        # covers every paragraph it touches.
+        pos = self.cursorForPosition(event.pos()).position()
+        line = self.document().findBlock(pos).blockNumber()
+        sel = self.textCursor()
+        if sel.hasSelection() and sel.selectionStart() <= pos <= sel.selectionEnd():
+            doc = self.document()
+            paras = list(range(doc.findBlock(sel.selectionStart()).blockNumber(),
+                               doc.findBlock(sel.selectionEnd()).blockNumber() + 1))
+        else:
+            paras = [line]
+        self.paragraphMenuRequested.emit(paras, event.globalPos())
+
+    def set_voice_tints(self, voices, label):
+        """Tint every paragraph with a voice of its own; `label` names voices."""
+        doc = self.document()
+        tints = voice_tints(voices)
+        cur = QTextCursor(doc)
+        cur.beginEditBlock()
+        block = doc.begin()
+        while block.isValid():
+            n = block.blockNumber()
+            fmt = block.blockFormat()
+            if n in voices:
+                fmt.setBackground(tints[voices[n]])
+            elif fmt.hasProperty(QTextBlockFormat.Property.BackgroundBrush):
+                fmt.clearBackground()
+            else:
+                block = block.next()
+                continue
+            cur.setPosition(block.position())
+            cur.setBlockFormat(fmt)
+            block = block.next()
+        cur.endEditBlock()
+        self.voice_names = {n: label(v) for n, v in voices.items()}
+
+    def viewportEvent(self, event):
+        if event.type() == QEvent.Type.ToolTip:
+            pos = self.cursorForPosition(event.pos()).position()
+            name = self.voice_names.get(self.document().findBlock(pos).blockNumber())
+            if name:
+                QToolTip.showText(event.globalPos(), f"Read by {name}", self.viewport())
+            else:
+                QToolTip.hideText()
+            return True
+        return super().viewportEvent(event)
+
     def mousePressEvent(self, event):
         self.press_pos = event.position().toPoint()
         super().mousePressEvent(event)
@@ -432,6 +505,8 @@ class MainWindow(QMainWindow):
         self.text_size = self.lib.setting("text_size", DEFAULT_TEXT_SIZE)
         self.icon_play = icons.icon("play", ACCENT_FG)
         self.icon_pause = icons.icon("pause", ACCENT_FG)
+        self.icon_star = icons.icon("star", ACCENT)
+        self.icon_star_outline = icons.icon("star-outline", FG)
 
         self.setWindowTitle(paths.APP_NAME)
         self.setAcceptDrops(True)
@@ -583,7 +658,7 @@ class MainWindow(QMainWindow):
         art.setAlignment(Qt.AlignmentFlag.AlignCenter)
         h1 = QLabel("Open a Book")
         h1.setObjectName("h1")
-        desc = QLabel("EPUB or PDF, or drop a file onto this window")
+        desc = QLabel("EPUB, PDF, DOCX or Markdown, or drop a file onto this window")
         desc.setObjectName("dim")
         for label in (h1, desc):
             label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -630,6 +705,7 @@ class MainWindow(QMainWindow):
         # Reading.
         self.view = SentenceView()
         self.view.sentenceClicked.connect(self.jump_to)
+        self.view.paragraphMenuRequested.connect(self._paragraph_menu)
         self.view.userScrolled.connect(self._stop_follow)
         self.view.zoomRequested.connect(lambda d: self.set_text_size(self.text_size + d))
         self.follow_btn = QPushButton("Back to Current Sentence")
@@ -748,7 +824,10 @@ class MainWindow(QMainWindow):
         self.voice_combo.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.voice_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
         self.voice_combo.currentIndexChanged.connect(self._on_voice)
+        self.favourite_btn = self._tool("star-outline", "Add to favourite voices",
+                                        self.toggle_favourite)
         end.addWidget(self.speed_btn)
+        end.addWidget(self.favourite_btn)
         end.addWidget(self.voice_combo)
 
         grid.addWidget(self.sleep_btn, 0, 0, Qt.AlignmentFlag.AlignLeft |
@@ -818,14 +897,14 @@ class MainWindow(QMainWindow):
         if not start or not os.path.isdir(start):
             start = str(Path.home())
         path, _filter = QFileDialog.getOpenFileName(
-            self, "Open a Book", start, "Books (*.epub *.pdf);;All files (*)")
+            self, "Open a Book", start, "Books (*.epub *.pdf *.docx *.md *.markdown);;All files (*)")
         if path:
             self.load_book(path)
 
     @staticmethod
     def _dropped_book(event):
         for url in event.mimeData().urls():
-            if url.isLocalFile() and url.toLocalFile().lower().endswith((".epub", ".pdf")):
+            if url.isLocalFile() and url.toLocalFile().lower().endswith(BOOK_SUFFIXES):
                 return url.toLocalFile()
         return None
 
@@ -882,6 +961,7 @@ class MainWindow(QMainWindow):
                             for w, s in zip(words, book.sentences)]
 
         self.view.load(book)
+        self._restore_paragraph_voices(book, entry)
         self._fill_chapters(book)
         self.current_chapter = -1
         self.syncing = True
@@ -953,33 +1033,68 @@ class MainWindow(QMainWindow):
     def _speed(self):
         return float(self.lib.setting("speed", "1.0"))
 
-    def _refresh_voices(self):
+    def _favourites(self):
+        return self.lib.setting("favourite_voices", [])
+
+    def _refresh_voices(self, force=False):
         voices = paths.list_voices()
-        if self.voices is not None and list(voices) == list(self.voices):
+        if not force and self.voices is not None and list(voices) == list(self.voices):
             return
         self.voices = voices
-        wanted = self._voice() or self.lib.setting("voice", paths.DEFAULT_VOICE)
+        wanted = self._voice() or self.lib.setting("voice", paths.default_voice(voices))
+        # Favourites first, starred, then a separator and every other voice.
+        favourites = [v for v in self._favourites() if v in voices]
         self.syncing = True
         self.voice_combo.clear()
+        for name in favourites:
+            self.voice_combo.addItem(f"★  {voice_label(name)}", name)
+        if favourites and len(favourites) < len(voices):
+            self.voice_combo.insertSeparator(self.voice_combo.count())
         for name in voices:
-            self.voice_combo.addItem(voice_label(name), name)
+            if name not in favourites:
+                self.voice_combo.addItem(voice_label(name), name)
         if voices:
             index = self.voice_combo.findData(wanted)
             if index < 0:
-                index = max(self.voice_combo.findData(paths.DEFAULT_VOICE), 0)
+                index = max(self.voice_combo.findData(paths.default_voice(voices)), 0)
             self.voice_combo.setCurrentIndex(index)
         else:
             self.voice_combo.addItem("No voices installed")
         self.voice_combo.setEnabled(bool(voices))
         self.syncing = False
+        self._update_favourite_button()
         if self._voice():
             self.player.set_voice(self._voice())
+
+    def toggle_favourite(self):
+        voice = self._voice()
+        if not voice:
+            return
+        favourites = list(self._favourites())
+        if voice in favourites:
+            favourites.remove(voice)
+            self.toast(f"Removed {voice_label(voice)} from favourites")
+        else:
+            favourites.append(voice)
+            self.toast(f"Added {voice_label(voice)} to favourites")
+        self.lib.set_setting("favourite_voices", favourites)
+        self.lib.save()
+        self._refresh_voices(force=True)
+
+    def _update_favourite_button(self):
+        voice = self._voice()
+        starred = bool(voice) and voice in self._favourites()
+        self.favourite_btn.setEnabled(bool(voice))
+        self.favourite_btn.setIcon(self.icon_star if starred else self.icon_star_outline)
+        self.favourite_btn.setToolTip("Remove from favourite voices" if starred
+                                      else "Add to favourite voices")
 
     def open_voices_folder(self):
         folder = paths.user_voices_dir()
         folder.mkdir(parents=True, exist_ok=True)
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
-        self.toast("Put piper voices (.onnx plus its .onnx.json) in this folder - "
+        self.toast("Put piper voices (.onnx plus its .onnx.json), or Kokoro's "
+                   "kokoro-v1.0.onnx and voices-v1.0.bin, in this folder - "
                    "they appear when you switch back here.")
 
     def changeEvent(self, event):
@@ -1059,9 +1174,84 @@ class MainWindow(QMainWindow):
         if self.book:
             self._update_labels(self.pos)
 
+    # -- paragraph voices ----------------------------------------------------
+    def _restore_paragraph_voices(self, book, entry):
+        """Saved as {paragraph: {voice, text}}; the text catches an edited file."""
+        installed = paths.list_voices()
+        missing = 0
+        for key, saved in (entry.get("voices") or {}).items():
+            n = int(key) if key.isdigit() else -1
+            if not 0 <= n < len(book.paragraphs) or \
+                    not book.paragraph_text(n).startswith(saved.get("text", "")):
+                continue
+            if saved.get("voice") in installed:
+                book.voices[n] = saved["voice"]
+            else:
+                missing += 1
+        self.view.set_voice_tints(book.voices, voice_label)
+        if missing:
+            self.toast(f"{missing} paragraph voice{'s' if missing > 1 else ''} "
+                       "aren't installed - using the book voice there")
+
+    def _paragraph_menu(self, paras, global_pos):
+        if not self.book or not self._voice():
+            return
+        chosen = {self.book.voices.get(n, "") for n in paras}
+        current = chosen.pop() if len(chosen) == 1 else None
+        voices = list(self.voices or [])
+        favourites = [v for v in self._favourites() if v in voices]
+        others = [v for v in voices if v not in favourites]
+
+        menu = QMenu(self)
+        # A disabled item, not addSection: Fusion draws a section's title as a bare line.
+        menu.addAction("Voice for this paragraph" if len(paras) == 1
+                       else f"Voice for {len(paras)} paragraphs").setEnabled(False)
+        menu.addSeparator()
+
+        def add(target, text, voice):
+            a = target.addAction(text)
+            a.setCheckable(True)
+            a.setChecked(voice == current)
+            a.triggered.connect(lambda _checked=False: self.set_paragraph_voice(paras, voice))
+
+        add(menu, f"Book voice ({voice_label(self._voice())})", "")
+        for v in favourites:
+            add(menu, f"★  {voice_label(v)}", v)
+        if others:
+            rest = menu.addMenu("Other voices" if favourites else "Voices")
+            for v in others:
+                add(rest, voice_label(v), v)
+        if self.book.voices:
+            menu.addSeparator()
+            clear = menu.addAction("Clear all paragraph voices")
+            clear.triggered.connect(
+                lambda _checked=False: self.set_paragraph_voice(list(self.book.voices), ""))
+        menu.exec(global_pos)
+
+    def set_paragraph_voice(self, paras, voice):
+        """Give paragraphs their own voice, or "" to hand them back to the book voice."""
+        book = self.book
+        if not book or not paras:
+            return
+        for n in paras:
+            if voice:
+                book.voices[n] = voice
+            else:
+                book.voices.pop(n, None)
+        self.lib.remember(book.path, voices={
+            str(n): {"voice": v, "text": book.paragraph_text(n)[:60]}
+            for n, v in sorted(book.voices.items())})
+        self.lib.save()
+        self.view.set_voice_tints(book.voices, voice_label)
+        self.player.voices_changed(paras)
+        count = "this paragraph" if len(paras) == 1 else f"{len(paras)} paragraphs"
+        self.toast(f"{voice_label(voice)} reads {count}" if voice
+                   else f"The book voice reads {count}")
+
     def _on_voice(self, _index):
         if self.syncing or not self._voice():
             return
+        self._update_favourite_button()
         self.lib.set_setting("voice", self._voice())
         self.lib.save()
         self.player.set_voice(self._voice())
