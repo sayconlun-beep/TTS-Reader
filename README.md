@@ -6,6 +6,12 @@ there; speed, voice, sleep timer and reading positions are remembered. Right-cli
 paragraph (or a selection spanning several) to have it read by a different voice, for
 dialogue or narration; those paragraphs get a soft tint, and the choice is saved per book.
 
+**Save as Audiobook** (the download button, or Ctrl+E) renders the whole book, paragraph
+voices included, into one `.m4b` with chapter markers for a phone (Apple Books, or an
+audiobook player such as Smart AudioBook Player or Voice on Android), or an `.mp3` for
+anything else. It runs in the background with a progress bar; closing the window keeps it
+going from the tray.
+
 A cross-platform Qt port of the GTK reader in the Hyprland rice, packaged for Windows
 and macOS.
 
@@ -69,5 +75,6 @@ publishes the installer, portable zip and DMG to one GitHub release:
 git tag v0.1.0 && git push origin v0.1.0
 ```
 
-The Kokoro model is Apache-2.0. piper-tts is GPL-3.0 and PyMuPDF is AGPL-3.0, so a public copy of this project needs a
+Audiobook export runs the static ffmpeg build from `imageio-ffmpeg` (GPL), which the
+PyInstaller spec copies into `ffmpeg/`. The Kokoro model is Apache-2.0. piper-tts is GPL-3.0 and PyMuPDF is AGPL-3.0, so a public copy of this project needs a
 compatible license.

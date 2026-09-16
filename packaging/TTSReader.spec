@@ -22,6 +22,10 @@ datas += collect_data_files("piper", excludes=[
     "**/train/**", "**/templates/**", "**/hebrew/**", "**/tashkeel/**"])
 datas += collect_data_files("pymupdf")
 binaries = collect_dynamic_libs("pymupdf") + collect_dynamic_libs("onnxruntime")
+# Audiobook export runs imageio-ffmpeg's static ffmpeg (AAC and LAME built in).
+# Only the binary goes in, to ffmpeg/, where tts_reader/export.py looks first.
+import imageio_ffmpeg
+binaries += [(imageio_ffmpeg.get_ffmpeg_exe(), "ffmpeg")]
 
 a = Analysis(
     [str(ROOT / "packaging" / "launch.py")],
@@ -29,7 +33,7 @@ a = Analysis(
     datas=datas,
     binaries=binaries,
     hiddenimports=["piper.espeakbridge", "sounddevice", "pymupdf"],
-    excludes=["tkinter", "piper.train", "piper.http_server", "matplotlib", "PIL",
+    excludes=["tkinter", "imageio_ffmpeg", "piper.train", "piper.http_server", "matplotlib", "PIL",
               "PySide6.QtNetwork", "PySide6.QtQml", "PySide6.QtQuick"],
     noarchive=False,
 )

@@ -69,6 +69,39 @@ class KokoroBackend:
         return [(np.clip(audio, -1, 1) * 32767).astype(np.int16)]
 
 
+class Models:
+    """Loaded voices, most recent last. Kokoro voices share one model. Hold
+    `lock` while rendering: a model isn't safe to use from two threads."""
+
+    def __init__(self):
+        self.loaded = collections.OrderedDict()     # voice -> backend
+        self.lock = threading.Lock()
+        self.kokoro = None              # (model path, Kokoro), kept across voices
+
+    def get(self, voice):
+        with self.lock:
+            model = self.loaded.pop(voice, None)
+            if model is None:
+                path = paths.list_voices().get(voice)
+                if not path:
+                    raise FileNotFoundError(f"no voice named {voice}")
+                if paths.is_kokoro(voice):
+                    if self.kokoro is None or self.kokoro[0] != path:
+                        from piper.phonemize_espeak import ESPEAK_DATA_DIR
+                        voices = os.path.join(os.path.dirname(path),
+                                              kokoro.KOKORO_VOICES)
+                        self.kokoro = (path, kokoro.Kokoro(path, voices,
+                                                           ESPEAK_DATA_DIR))
+                    model = KokoroBackend(
+                        self.kokoro[1], voice[len(paths.KOKORO_PREFIX):])
+                else:
+                    model = PiperBackend(path)
+                while len(self.loaded) >= MODELS_KEPT:
+                    self.loaded.popitem(last=False)
+            self.loaded[voice] = model
+            return model
+
+
 class SoundOutput:
     def __init__(self, rate, fill):
         import sounddevice as sd
@@ -142,9 +175,7 @@ class Player(QObject):
         self.output = None
         self.rate = None
         self.thread = None
-        self.models = collections.OrderedDict()     # voice -> backend, recent last
-        self.model_lock = threading.Lock()
-        self.kokoro = None              # (model path, Kokoro), kept across voices
+        self.models = Models()
         # Other threads never touch Qt: they post events, drained here.
         self.poll = QTimer(self)
         self.poll.setInterval(40)
@@ -347,27 +378,7 @@ class Player(QObject):
             self.jump(self.pos, play=not self.is_paused)
 
     def _model_for(self, voice):
-        with self.model_lock:
-            model = self.models.pop(voice, None)
-            if model is None:
-                path = paths.list_voices().get(voice)
-                if not path:
-                    raise FileNotFoundError(f"no voice named {voice}")
-                if paths.is_kokoro(voice):
-                    if self.kokoro is None or self.kokoro[0] != path:
-                        from piper.phonemize_espeak import ESPEAK_DATA_DIR
-                        voices = os.path.join(os.path.dirname(path),
-                                              kokoro.KOKORO_VOICES)
-                        self.kokoro = (path, kokoro.Kokoro(path, voices,
-                                                           ESPEAK_DATA_DIR))
-                    model = KokoroBackend(
-                        self.kokoro[1], voice[len(paths.KOKORO_PREFIX):])
-                else:
-                    model = PiperBackend(path)
-                while len(self.models) >= MODELS_KEPT:
-                    self.models.popitem(last=False)
-            self.models[voice] = model
-            return model
+        return self.models.get(voice)
 
     def _render_loop(self, book, session):
         total = len(book.sentences)
@@ -407,7 +418,7 @@ class Player(QObject):
         err = None
         for _attempt in range(2):
             try:
-                with self.model_lock:
+                with self.models.lock:
                     parts = model.render(text, speed)
                 break
             except Exception as e:

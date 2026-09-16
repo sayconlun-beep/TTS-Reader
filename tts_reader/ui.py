@@ -3,6 +3,7 @@
 import bisect
 import itertools
 import os
+import re
 import time
 from pathlib import Path
 
@@ -23,6 +24,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox,
 from . import icons, paths
 from .book import BOOK_SUFFIXES, BookError, open_book
 from .engine import Player
+from .export import FORMATS, Exporter
 from .library import Library
 
 WPM = 160           # for the time-left estimate at 1.0x
@@ -95,6 +97,10 @@ QMenu::item { padding: 6px 24px 6px 24px; border-radius: 6px; }
 QMenu::item:selected { background: @raised; }
 QMenu::item:disabled { color: @off; }
 QMenu::separator { height: 1px; background: @border; margin: 4px 8px; }
+#exportBar { background: @surface; border-bottom: 1px solid @border; }
+QPushButton#flat { background: @raised; color: @fg; border: none; border-radius: 8px;
+                   padding: 5px 14px; }
+QPushButton#flat:hover { background: @border; }
 #toast { background: @surface; color: @fg; border: 1px solid @border;
          border-radius: 16px; padding: 8px 18px; }
 QProgressBar { background: @raised; border: none; border-radius: 3px; }
@@ -502,6 +508,7 @@ class MainWindow(QMainWindow):
         self.voices = None
         self.tray = None
         self.tray_hint_shown = False
+        self.exporter = None
         self.text_size = self.lib.setting("text_size", DEFAULT_TEXT_SIZE)
         self.icon_play = icons.icon("play", ACCENT_FG)
         self.icon_pause = icons.icon("pause", ACCENT_FG)
@@ -522,6 +529,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         self._build_actions()
         column.addWidget(self._build_header())
+        column.addWidget(self._build_export_bar())
         self.stack = QStackedWidget()
         column.addWidget(self.stack, 1)
         self._build_pages()
@@ -575,6 +583,7 @@ class MainWindow(QMainWindow):
             self.text_size - 1), ["Ctrl+-"])
         self.act_zoom_reset = act("Reset Text Size", lambda: self.set_text_size(
             DEFAULT_TEXT_SIZE), ["Ctrl+0"])
+        self.act_export = act("Save as Audiobook…", self.choose_export, ["Ctrl+E"])
         self.act_voices = act("Add Voices…", self.open_voices_folder)
         self.act_quit = act("Quit", self.quit_app, ["Ctrl+Q"])
 
@@ -632,16 +641,50 @@ class MainWindow(QMainWindow):
         for a in (self.act_zoom_in, self.act_zoom_out, self.act_zoom_reset):
             menu.addAction(a)
         menu.addSeparator()
+        menu.addAction(self.act_export)
         menu.addAction(self.act_voices)
         menu.addAction(self.act_close)
         menu.addSeparator()
         menu.addAction(self.act_quit)
+        self.export_btn = self._tool("export", "Save as an audiobook for your phone (Ctrl+E)",
+                                     self.choose_export)
+        right.addWidget(self.export_btn)
         right.addWidget(self._menu_button(self._tool("menu", "Menu"), menu))
 
         grid.addLayout(left, 0, 0)
         grid.addLayout(titles, 0, 1)
         grid.addLayout(right, 0, 2)
         return header
+
+    def _build_export_bar(self):
+        bar = QWidget()
+        bar.setObjectName("exportBar")
+        bar.setAttribute(Qt.WidgetAttribute.WA_StyledBackground)
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(16, 8, 16, 8)
+        row.setSpacing(12)
+        self.export_label = ElidedLabel("")
+        self.export_progress = QProgressBar()
+        self.export_progress.setTextVisible(False)
+        self.export_progress.setFixedHeight(6)
+        self.export_progress.setRange(0, 1000)
+        self.export_progress.setMaximumWidth(260)
+        self.export_cancel = QPushButton("Cancel")
+        self.export_folder = QPushButton("Open Folder")
+        self.export_dismiss = QPushButton("Close")
+        self.export_cancel.clicked.connect(self.cancel_export)
+        self.export_folder.clicked.connect(self._open_export_folder)
+        self.export_dismiss.clicked.connect(lambda: self.export_bar.hide())
+        row.addWidget(self.export_label, 1)
+        row.addWidget(self.export_progress, 1)
+        for b in (self.export_cancel, self.export_folder, self.export_dismiss):
+            b.setObjectName("flat")
+            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            row.addWidget(b)
+        bar.hide()
+        self.export_bar = bar
+        self.export_saved = None
+        return bar
 
     def _build_pages(self):
         # Nothing open.
@@ -844,6 +887,8 @@ class MainWindow(QMainWindow):
         self.player_bar.setVisible(index == self.READER)
         self.sidebar_btn.setEnabled(index == self.READER)
         self.act_close.setEnabled(self.book is not None)
+        self.act_export.setEnabled(index == self.READER and self.exporter is None)
+        self.export_btn.setVisible(index == self.READER)
 
     def toast(self, text):
         self.toast_label.show_message(text)
@@ -1336,15 +1381,98 @@ class MainWindow(QMainWindow):
     def _on_stopped(self):
         self._on_paused(True)
         self.save_position()
-        if not self.isVisible():
+        if not self.isVisible() and self.exporter is None:
             self.quit_app()
 
     def _on_ended(self):
         self.player.set_paused(True)
         self.save_position()
         self.toast("Finished the book")
-        if not self.isVisible():
+        if not self.isVisible() and self.exporter is not None:
+            self.player.stop()          # the tray stays for the export
+        elif not self.isVisible():
             self.quit_app()
+
+    # -- audiobook export ----------------------------------------------------
+    def choose_export(self):
+        if self.book is None or self.exporter is not None:
+            return
+        folder = self.lib.setting("export_dir", "")
+        if not folder or not os.path.isdir(folder):
+            folder = os.path.dirname(self.book.path)
+        stem = re.sub(r'[\\/:*?"<>|]+', " ", self.book.title).strip() or "Audiobook"
+        path, chosen = QFileDialog.getSaveFileName(
+            self, "Save as Audiobook", os.path.join(folder, f"{stem}.m4b"),
+            "Audiobook with chapters (*.m4b);;MP3 (*.mp3)")
+        if not path:
+            return
+        if os.path.splitext(path)[1].lower() not in FORMATS:
+            path += ".mp3" if chosen.startswith("MP3") else ".m4b"
+        self.start_export(self.book, self._voice(), path)
+
+    def start_export(self, book, voice, path):
+        self.lib.set_setting("export_dir", os.path.dirname(path))
+        self.lib.save()
+        self.exporter = Exporter(book, voice, path)
+        self.exporter.progress.connect(self._on_export_progress)
+        self.exporter.finished.connect(self._on_export_finished)
+        self.exporter.failed.connect(self._on_export_failed)
+        self.act_export.setEnabled(False)
+        self.export_label.setText(f"Saving “{os.path.basename(path)}”…")
+        self.export_progress.setValue(0)
+        self._export_bar_state(running=True)
+        self.exporter.start()
+
+    def cancel_export(self):
+        if self.exporter:
+            self.exporter.cancel()
+            self._export_ended()
+            self.export_bar.hide()
+            self.toast("Audiobook export cancelled")
+
+    def _export_bar_state(self, running):
+        self.export_progress.setVisible(running)
+        self.export_cancel.setVisible(running)
+        self.export_folder.setVisible(not running)
+        self.export_dismiss.setVisible(not running)
+        self.export_bar.show()
+
+    def _on_export_progress(self, done, eta):
+        if self.exporter is None or self.sender() is not self.exporter:
+            return
+        self.export_progress.setValue(int(done * 1000))
+        left = time_left_label(eta / 60) if done > 0.01 else "estimating time"
+        self.export_label.setText(f"Saving “{os.path.basename(self.exporter.out)}” · "
+                                  f"{int(done * 100)}% · {left}")
+
+    def _on_export_finished(self, path):
+        if self.exporter is None or self.sender() is not self.exporter:
+            return
+        self._export_ended()
+        self.export_saved = path
+        self.export_label.setText(f"Saved “{os.path.basename(path)}”")
+        self._export_bar_state(running=False)
+        self._export_message(f"Saved {os.path.basename(path)}")
+
+    def _on_export_failed(self, message):
+        if self.exporter is None or self.sender() is not self.exporter:
+            return
+        self._export_ended()
+        self.export_bar.hide()
+        self.toast(message)
+        self._export_message(message)
+
+    def _export_ended(self):
+        self.exporter = None
+        self.act_export.setEnabled(self.stack.currentIndex() == self.READER)
+
+    def _export_message(self, text):
+        if not self.isVisible() and self.tray:
+            self.tray.showMessage(paths.APP_NAME, text, self.windowIcon(), 8000)
+
+    def _open_export_folder(self):
+        if self.export_saved:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.dirname(self.export_saved)))
 
     # -- scrolling -----------------------------------------------------------
     def _stop_follow(self):
@@ -1404,6 +1532,13 @@ class MainWindow(QMainWindow):
             self.hide()
             self._show_tray()
             return
+        if self.exporter is not None and QSystemTrayIcon.isSystemTrayAvailable():
+            # Keep saving the audiobook in the background from the tray.
+            event.ignore()
+            self.player.stop()
+            self.hide()
+            self._show_tray()
+            return
         event.accept()
         self.quit_app()
 
@@ -1422,7 +1557,8 @@ class MainWindow(QMainWindow):
         self.tray.show()
         if not self.tray_hint_shown:
             self.tray_hint_shown = True
-            self.tray.showMessage(paths.APP_NAME, "Still reading. Click the tray "
+            doing = "Still reading" if self.player.running else "Still saving the audiobook"
+            self.tray.showMessage(paths.APP_NAME, f"{doing}. Click the tray "
                                   "icon to bring the window back.",
                                   self.windowIcon(), 4000)
 
@@ -1440,6 +1576,8 @@ class MainWindow(QMainWindow):
     def quit_app(self):
         self.save_position()
         self.player.stop()
+        if self.exporter:
+            self.exporter.cancel()
         if self.tray:
             self.tray.hide()
         self.app.removeEventFilter(self)

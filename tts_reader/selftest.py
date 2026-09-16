@@ -339,7 +339,25 @@ def _run(log, tmp, shot):
         raise AssertionError(f"player error: {errors[0]}")
     no_slot_errors("playback")
     log("jump + end of book: ok")
+    window.player.stop()
+
+    from .export import ffmpeg_path
+    log(f"ffmpeg: {ffmpeg_path()}")
+    window.set_paragraph_voice([1], other)
+    out = os.path.join(tmp, "sample.m4b")
+    window.start_export(window.book, voice, out)
+    _check("export bar shown", window.export_bar.isVisible(), True)
+    _wait(app, lambda: window.exporter is None, 300, "the audiobook export")
+    no_slot_errors("export")
+    if not os.path.exists(out):
+        raise AssertionError(f"export failed: {window.toast_label.text()}")
+    import re
+    import subprocess
+    report = subprocess.run([ffmpeg_path(), "-hide_banner", "-i", out], capture_output=True,
+                            text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stderr
+    chapters = re.findall(r"title\s+: (Chapter One|Chapter Two|Part Two)", report)
+    _check("audiobook chapters", chapters, ["Chapter One", "Chapter Two", "Part Two"])
+    log(f"audiobook export: {os.path.getsize(out) // 1024} KB, chapters ok")
     if shot:
         window.grab().save(shot)
-    window.player.stop()
     window.close()
